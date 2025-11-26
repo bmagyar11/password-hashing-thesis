@@ -90,7 +90,7 @@ cpuPass_benchmark_<timestamp>.json
 The JSON includes:
 - System metadata
 - All sequential and parallel metrics
-- GPU benchmark results (if enabled)
+- GPU benchmark results
 - Aggregated peak hash-rate per algorithm
 - Crack-time estimates for:
   - multiple attacker models
@@ -156,7 +156,7 @@ This directory is auto-created if missing.
 
 ## Notes
 
-- Parallel execution is disabled for memory-hard algorithms (scrypt, Argon2) due to RAM constraints.
+- Parallel execution is automatically skipped for memory-hard algorithms (scrypt, Argon2) due to if RAM constraints are present.
 - OpenCL benchmark validates device memory and work-group limits before running.
 - Vulkan path requires a functioning Vulkan loader and GPU driver.
 
