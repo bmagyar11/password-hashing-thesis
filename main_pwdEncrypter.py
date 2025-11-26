@@ -302,7 +302,7 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
     buf_in = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=host_in)
     buf_out = cl.Buffer(ctx, mf.WRITE_ONLY, host_out.nbytes)
 
-    # build program (use existing OPENCL_MD5_KERNEL from your script)
+    # build program (use existing OPENCL_MD5_KERNEL)
     program = cl.Program(ctx, OPENCL_MD5_KERNEL).build(options=[])
     kernel = program.md5_round_kernel
 
