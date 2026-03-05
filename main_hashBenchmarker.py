@@ -19,7 +19,7 @@ import psutil
 from datetime import datetime
 import multiprocessing
 import math
-import vulkan as vk
+
 
 
 # --- Importing GPU libraries with fallback ---
@@ -33,7 +33,7 @@ except Exception:
 HAVE_VULKAN = True
 try:
     # lightweight wrapper name is 'vulkan' (may differ). If not present, skip.
-    from vulkan import vk, helpers as vk_helpers
+    import vulkan as vk
     import ctypes
 except Exception:
     HAVE_VULKAN = False
@@ -357,86 +357,265 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
 # -------------------------
 # GPU: Vulkan compute benchmark, only works with a dedicated GPU
 
-def benchmark_vulkan_md5(spv_path=None, n_items=2_000_000):
+def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
     """
-    Ultra-minimalistic Vulkan 'benchmark'.
+    Real Vulkan compute MD5 benchmark.
+    Dispatches a SPIR-V compute shader that performs actual MD5 rounds on the GPU.
+    Requires: compiled md5_vulkan.spv (glslc md5_vulkan.comp -o md5_vulkan.spv)
     """
     if not HAVE_VULKAN:
         raise RuntimeError("Vulkan python wrapper is not installed.")
 
-    # Create instance
+    if spv_path is None or not os.path.exists(spv_path):
+        raise RuntimeError(
+            f"SPIR-V shader not found at '{spv_path}'. "
+            "Compile it with: glslc md5_vulkan.comp -o md5_vulkan.spv"
+        )
+
+    def VK_NAME_VERSION(major, minor, patch):
+        return (major << 22) | (minor << 12) | patch
+
     app_info = vk.VkApplicationInfo(
         sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        pApplicationName=b"FakeVulkanBenchmark",
-        applicationVersion=1,
+        pApplicationName=b"VulkanMD5Bench",
+        applicationVersion=VK_NAME_VERSION(1, 0, 0),
         pEngineName=b"NoEngine",
-        engineVersion=1,
-        apiVersion=vk.VK_API_VERSION_1_0,
+        engineVersion=VK_NAME_VERSION(1, 0, 0),
+        apiVersion=VK_NAME_VERSION(1, 0, 0),
     )
-    inst_info = vk.VkInstanceCreateInfo(
-        sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        pApplicationInfo=app_info
+    instance = vk.vkCreateInstance(
+        vk.VkInstanceCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            pApplicationInfo=app_info
+        ), None
     )
-    instance = vk.vkCreateInstance(inst_info, None)
 
-    # Pick first physical device
+
     phys_devs = vk.vkEnumeratePhysicalDevices(instance)
     if not phys_devs:
-        raise RuntimeError("No available Vulkan-compatible GPU.")
-
+        raise RuntimeError("No Vulkan-compatible GPU found.")
     phys = phys_devs[0]
     props = vk.vkGetPhysicalDeviceProperties(phys)
-    device_name = props.deviceName.decode("utf-8", errors="ignore")
+    device_name = props.deviceName if isinstance(props.deviceName, str) else props.deviceName.decode("utf-8", errors="ignore")
 
-    # Create logical device (compute queue)
-    queue_family_props = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys)
-    compute_family_index = None
-    for i, qf in enumerate(queue_family_props):
-        if qf.queueFlags & vk.VK_QUEUE_COMPUTE_BIT:
-            compute_family_index = i
-            break
-    if compute_family_index is None:
-        raise RuntimeError("Vulkan compute queue not found.")
+    mem_props = vk.vkGetPhysicalDeviceMemoryProperties(phys)
 
-    queue_priority = ctypes.c_float(1.0)
-    queue_info = vk.VkDeviceQueueCreateInfo(
-        sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        queueFamilyIndex=compute_family_index,
-        queueCount=1,
-        pQueuePriorities=ctypes.pointer(queue_priority)
+
+    qf_props = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys)
+    compute_family = next(
+        (i for i, q in enumerate(qf_props) if q.queueFlags & vk.VK_QUEUE_COMPUTE_BIT),
+        None
     )
+    if compute_family is None:
+        raise RuntimeError("No compute queue family found.")
 
-    dev_info = vk.VkDeviceCreateInfo(
+
+    queue_priority = (ctypes.c_float * 1)(1.0)
+    device = vk.vkCreateDevice(phys, vk.VkDeviceCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         queueCreateInfoCount=1,
-        pQueueCreateInfos=queue_info
+        pQueueCreateInfos=vk.VkDeviceQueueCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            queueFamilyIndex=compute_family,
+            queueCount=1,
+            pQueuePriorities=ctypes.pointer(queue_priority)
+        )
+    ), None)
+    queue = vk.vkGetDeviceQueue(device, compute_family, 0)
+
+
+    def find_memory_type(type_filter, props_required):
+        for i in range(mem_props.memoryTypeCount):
+            if (type_filter & (1 << i)) and \
+               (mem_props.memoryTypes[i].propertyFlags & props_required) == props_required:
+                return i
+        raise RuntimeError("No suitable memory type found.")
+
+
+    def make_buffer(size_bytes, usage):
+        buf = vk.vkCreateBuffer(device, vk.VkBufferCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            size=size_bytes,
+            usage=usage,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE
+        ), None)
+        mem_req = vk.vkGetBufferMemoryRequirements(device, buf)
+        mem = vk.vkAllocateMemory(device, vk.VkMemoryAllocateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            allocationSize=mem_req.size,
+            memoryTypeIndex=find_memory_type(
+                mem_req.memoryTypeBits,
+                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            )
+        ), None)
+        vk.vkBindBufferMemory(device, buf, mem, 0)
+        return buf, mem, mem_req.size
+
+
+
+    item_count   = n_items
+    in_bytes     = item_count * 16 * 4   # uint32 per word, 16 words per block
+    out_bytes    = item_count * 4        # one uint32 result per item
+
+    buf_in,  mem_in,  _  = make_buffer(in_bytes,  vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    buf_out, mem_out, _  = make_buffer(out_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+
+
+    ptr = vk.vkMapMemory(device, mem_in, 0, in_bytes, 0)
+    import numpy as np
+    rng = np.random.default_rng()
+    host_in = rng.integers(0, 2**32, size=item_count * 16, dtype=np.uint32)
+    ctypes.memmove(ptr, host_in.ctypes.data, in_bytes)
+    vk.vkUnmapMemory(device, mem_in)
+
+
+    with open(spv_path, "rb") as f:
+        spv_bytes = f.read()
+    spv_words = np.frombuffer(spv_bytes, dtype=np.uint32)
+    shader_module = vk.vkCreateShaderModule(device, vk.VkShaderModuleCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        codeSize=len(spv_bytes),
+        pCode=spv_words.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32))
+    ), None)
+
+
+    bindings = [
+        vk.VkDescriptorSetLayoutBinding(
+            binding=b, descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptorCount=1, stageFlags=vk.VK_SHADER_STAGE_COMPUTE_BIT
+        ) for b in (0, 1)
+    ]
+    ds_layout = vk.vkCreateDescriptorSetLayout(device, vk.VkDescriptorSetLayoutCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        bindingCount=2, pBindings=bindings
+    ), None)
+
+
+    pipeline_layout = vk.vkCreatePipelineLayout(device, vk.VkPipelineLayoutCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        setLayoutCount=1, pSetLayouts=[ds_layout]
+    ), None)
+
+    pipeline = vk.vkCreateComputePipelines(device, None, 1, [
+        vk.VkComputePipelineCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            stage=vk.VkPipelineShaderStageCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                module=shader_module,
+                pName=b"main"
+            ),
+            layout=pipeline_layout
+        )
+    ], None)[0]
+
+
+    desc_pool = vk.vkCreateDescriptorPool(device, vk.VkDescriptorPoolCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        maxSets=1,
+        poolSizeCount=1,
+        pPoolSizes=[vk.VkDescriptorPoolSize(
+            type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount=2
+        )]
+    ), None)
+
+    desc_set = vk.vkAllocateDescriptorSets(device, vk.VkDescriptorSetAllocateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptorPool=desc_pool,
+        descriptorSetCount=1,
+        pSetLayouts=[ds_layout]
+    ))[0]
+
+    vk.vkUpdateDescriptorSets(device, 2, [
+        vk.VkWriteDescriptorSet(
+            sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=desc_set, dstBinding=b,
+            descriptorCount=1, descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[vk.VkDescriptorBufferInfo(
+                buffer=buf_in if b == 0 else buf_out,
+                offset=0,
+                range=in_bytes if b == 0 else out_bytes
+            )]
+        ) for b in (0, 1)
+    ], 0, None)
+
+
+    cmd_pool = vk.vkCreateCommandPool(device, vk.VkCommandPoolCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        queueFamilyIndex=compute_family
+    ), None)
+
+    cmd_buf = vk.vkAllocateCommandBuffers(device, vk.VkCommandBufferAllocateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        commandPool=cmd_pool,
+        level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        commandBufferCount=1
+    ))[0]
+
+    vk.vkBeginCommandBuffer(cmd_buf, vk.VkCommandBufferBeginInfo(
+        sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    ))
+    vk.vkCmdBindPipeline(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+    vk.vkCmdBindDescriptorSets(
+        cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline_layout, 0, 1, [desc_set], 0, None
     )
+    local_size = 64
+    vk.vkCmdDispatch(cmd_buf, (item_count + local_size - 1) // local_size, 1, 1)
+    vk.vkEndCommandBuffer(cmd_buf)
 
-    device = vk.vkCreateDevice(phys, dev_info, None)
 
-    # Queue handle
-    queue = vk.vkGetDeviceQueue(device, compute_family_index, 0)
+    fence = vk.vkCreateFence(device, vk.VkFenceCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, flags=0
+    ), None)
 
-    # Fake workload: just time.sleep + compute fake throughput
-    t0 = time.perf_counter()
-    time.sleep(0.05)      # 50 ms workload
-    t1 = time.perf_counter()
-    duration = t1 - t0
+    def submit_and_wait():
+        vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(
+            sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount=1, pCommandBuffers=[cmd_buf]
+        )], fence)
+        vk.vkWaitForFences(device, 1, [fence], vk.VK_TRUE, int(10_000_000_000))  # 10s timeout
+        vk.vkResetFences(device, 1, [fence])
 
-    hash_per_sec = n_items / duration
+    submit_and_wait()  # warmup
 
-    # Cleanup
+
+    repeats = 3
+    total_time = 0.0
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        submit_and_wait()
+        total_time += time.perf_counter() - t0
+
+    hash_per_sec = (item_count * repeats) / total_time
+
+
+    vk.vkDestroyFence(device, fence, None)
+    vk.vkDestroyCommandPool(device, cmd_pool, None)
+    vk.vkDestroyDescriptorPool(device, desc_pool, None)
+    vk.vkDestroyPipeline(device, pipeline, None)
+    vk.vkDestroyPipelineLayout(device, pipeline_layout, None)
+    vk.vkDestroyDescriptorSetLayout(device, ds_layout, None)
+    vk.vkDestroyShaderModule(device, shader_module, None)
+    vk.vkFreeMemory(device, mem_out, None)
+    vk.vkFreeMemory(device, mem_in, None)
+    vk.vkDestroyBuffer(device, buf_out, None)
+    vk.vkDestroyBuffer(device, buf_in, None)
     vk.vkDestroyDevice(device, None)
     vk.vkDestroyInstance(instance, None)
 
     return {
         "backend": "vulkan",
         "device": device_name,
-        "items_requested": n_items,
-        "seconds": duration,
+        "items_requested": item_count,
+        "seconds": total_time,
         "hash_per_sec": hash_per_sec,
         "notes": {
-            "info": "Minimal Vulkan compute initialization benchmark. No actual shader dispatch."
+            "shader": spv_path,
+            "repeats": repeats,
+            "local_size": local_size,
+            "info": "Real Vulkan compute MD5 — full 64-round shader dispatch."
         }
     }
 
