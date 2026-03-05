@@ -63,10 +63,10 @@ WORKER_COUNTS = [1, max(1, multiprocessing.cpu_count()//2), multiprocessing.cpu_
 
 # default attacker models for brute force simulation
 ATTACKER_MODELS = [
-    {"name": "same_machine_cpu", "source": "measured", "multiplier": 1.0, "desc": "a mért hash rate a jelen gépen"},
-    {"name": "single_gpu_est", "source": "measured", "multiplier": 50.0, "desc": "nyers GPU gyorsítás ~ durva becslés"},
-    {"name": "multi_gpu_8_est", "source": "measured", "multiplier": 400.0, "desc": "8× gyorsítás (durva)"},
-    {"name": "botnet_1000_est", "source": "measured", "multiplier": 1000.0, "desc": "nagyszabású, több gépes (szimbolikus)"},
+    {"name": "same_machine_cpu", "source": "measured", "multiplier": 1.0, "desc": "a mert hash rate a jelen gepen"},
+    {"name": "single_gpu_est", "source": "measured", "multiplier": 50.0, "desc": "nyers GPU gyorsitas ~ durva becsles"},
+    {"name": "multi_gpu_8_est", "source": "measured", "multiplier": 400.0, "desc": "8× gyorsitas (durva)"},
+    {"name": "botnet_1000_est", "source": "measured", "multiplier": 1000.0, "desc": "nagyszabasu, tobb gepes (szimbolikus)"},
 ]
 
 CHARSETS = {
@@ -170,18 +170,21 @@ def make_argon2(time_cost, memory_cost, parallelism):
 def mp_worker(descriptor, inputs, rounds_per_worker):
     kind = descriptor["kind"]
     p = descriptor.get("params", {})
-    if kind == "md5":
-        func = hash_md5
-    elif kind == "sha256":
-        func = hash_sha256
-    elif kind == "bcrypt":
-        func = make_bcrypt(p["cost"])
-    elif kind == "scrypt":
-        func = make_scrypt(p["n"], p["r"], p["p"])
-    elif kind == "argon2":
-        func = make_argon2(p["time_cost"], p["memory_cost"], p["parallelism"])
-    else:
-        raise RuntimeError("Unknown kind")
+
+    match kind:
+        case "md5":
+            func = hash_md5
+        case "sha256":
+            func = hash_sha256
+        case "bcrypt":
+            func = make_bcrypt(p["cost"])
+        case "scrypt":
+            func = make_scrypt(p["n"], p["r"], p["p"])
+        case "argon2":
+            func = make_argon2(p["time_cost"], p["memory_cost"], p["parallelism"])
+        case _:
+            raise RuntimeError("Unknown kind")
+
     t0 = time.perf_counter()
     for i in range(rounds_per_worker):
         func(inputs[i % len(inputs)].encode())
@@ -302,7 +305,7 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
     buf_in = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=host_in)
     buf_out = cl.Buffer(ctx, mf.WRITE_ONLY, host_out.nbytes)
 
-    # build program (use existing OPENCL_MD5_KERNEL)
+    # build program (use existing OPENCL_MD5_KERNEL from your script)
     program = cl.Program(ctx, OPENCL_MD5_KERNEL).build(options=[])
     kernel = program.md5_round_kernel
 
@@ -352,14 +355,14 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
 
 
 # -------------------------
-# GPU: Vulkan compute benchmark
+# GPU: Vulkan compute benchmark, only works with a dedicated GPU
 
-def benchmark_vulkan_md5(spv_path, n_items=2_000_000):
+def benchmark_vulkan_md5(spv_path=None, n_items=2_000_000):
     """
     Ultra-minimalistic Vulkan 'benchmark'.
     """
     if not HAVE_VULKAN:
-        raise RuntimeError("Vulkan python wrapper nincs telepítve.")
+        raise RuntimeError("Vulkan python wrapper is not installed.")
 
     # Create instance
     app_info = vk.VkApplicationInfo(
@@ -449,7 +452,7 @@ def build_tests():
     for (n,r,p) in SCRYPT_PARAMS:
         tests.append({"name":f"scrypt_n{n}_r{r}_p{p}", "kind":"scrypt", "params":{"n":n,"r":r,"p":p}})
     for ap in ARGON2_PARAMS:
-        nm = f"argon2_t{ap['time_cost']}_m{ap['memory_cost']//1024}KB_p{ap['parallelism']}"
+        nm = f"argon2_t{ap['time_cost']}_m{ap['memory_cost']//1024}MB_p{ap['parallelism']}"
         tests.append({"name":nm, "kind":"argon2", "params":ap})
     return tests
 
@@ -457,6 +460,11 @@ def build_tests():
 # Crack-time calculator
 # -------------------------
 def compute_estimates_for_test(best_throughput, custom_attack_models=None, charset_specs=None):
+    try:
+        best_throughput = float(best_throughput)
+    except (TypeError, ValueError):
+        return {}
+
     if best_throughput <= 0 or math.isinf(best_throughput) or math.isnan(best_throughput):
         return {}
 
@@ -542,7 +550,7 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
     for t in tests:
         for w in WORKER_COUNTS:
             if t["kind"] in ["scrypt", "argon2"] and w > 1:
-                print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy)")
+                print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy, uses internal parallelism)")
                 continue
             print(f"[PAR] {t['name']} workers={w}")
             try:
@@ -602,7 +610,7 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
 
     estimates_per_test = {}
     for a in aggregated:
-        estimates_per_test[a["test_name"]] = compute_estimates_for_test(a["test_name"], a["best_hash_s"])
+        estimates_per_test[a["test_name"]] = compute_estimates_for_test(a["best_hash_s"])
 
     out = {"meta":meta, "results": results, "aggregated": aggregated, "crack_estimates": estimates_per_test}
     if save_json:
