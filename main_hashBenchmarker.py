@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Run:
-  python main_pwdEncrypter.py --rounds 30 --opencl --vulkan
+  python main_hashBenchmarker.py --rounds 30 --opencl --vulkan
 
 Dependencies:
   pip install bcrypt argon2-cffi psutil vulkan pyopencl
@@ -216,21 +216,71 @@ def measure_parallel(descriptor, inputs, rounds, workers):
 # GPU: OpenCL benchmark (MD5-round microbenchmark)
 # -------------------------
 OPENCL_MD5_KERNEL = r"""
-__constant uint A = 0x67452301;
-__constant uint B = 0xefcdab89;
-__constant uint C = 0x98badcfe;
-__constant uint D = 0x10325476;
+__constant uint T[64] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+};
 
-uint F(uint x, uint y, uint z){ return (x & y) | (~x & z); }
-uint rotl(uint x, uint n){ return (x << n) | (x >> (32-n)); }
+__constant uint S[64] = {
+    7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+    5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+    4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+    6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
+};
+
+uint rotl(uint x, uint n){ return (x << n) | (x >> (32u - n)); }
 
 __kernel void md5_round_kernel(__global const uint *input, __global uint *output) {
     int gid = get_global_id(0);
-    uint a = A, b = B, c = C, d = D;
-    uint m = input[gid];
-    // single simplified MD5 round for benchmark
-    a = b + rotl(a + F(b,c,d) + m + 0xd76aa478, 7);
-    output[gid] = a;
+
+    // each work item gets 16 uint32 words (one 64-byte MD5 block)
+    uint M[16];
+    for (int i = 0; i < 16; i++) {
+        M[i] = input[gid * 16 + i];
+    }
+
+    uint a = 0x67452301u;
+    uint b = 0xefcdab89u;
+    uint c = 0x98badcfeu;
+    uint d = 0x10325476u;
+
+    for (int i = 0; i < 64; i++) {
+        uint F_val; uint g;
+        if (i < 16) {
+            F_val = (b & c) | (~b & d);
+            g = i;
+        } else if (i < 32) {
+            F_val = (d & b) | (~d & c);
+            g = (5*i + 1) % 16;
+        } else if (i < 48) {
+            F_val = b ^ c ^ d;
+            g = (3*i + 5) % 16;
+        } else {
+            F_val = c ^ (b | ~d);
+            g = (7*i) % 16;
+        }
+        uint temp = d;
+        d = c;
+        c = b;
+        b = b + rotl(a + F_val + M[g] + T[i], S[i]);
+        a = temp;
+    }
+
+    output[gid] = a + 0x67452301u;
 }
 """
 
@@ -277,7 +327,7 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
     max_work_item_sizes = tuple(chosen_dev.max_work_item_sizes)
 
     # Basic safety checks
-    needed_bytes = n_items * np.dtype(np.uint32).itemsize * 2  # in + out
+    needed_bytes = n_items * 16 * np.dtype(np.uint32).itemsize + n_items * np.dtype(np.uint32).itemsize
     if needed_bytes > global_mem:
         raise RuntimeError(f"Requested buffers (~{needed_bytes//1024//1024}MB) exceed device global memory ({global_mem//1024//1024}MB). Reduce n_items.")
 
@@ -298,7 +348,7 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
 
     # Use new Generator.integers to avoid int32 'high' problems
     rng = np.random.default_rng()
-    host_in = rng.integers(low=0, high=2**32, size=global_size, dtype=np.uint32)  # note: global_size >= n_items
+    host_in = rng.integers(low=0, high=2**32, size=global_size * 16, dtype=np.uint32)
     host_out = np.zeros(global_size, dtype=np.uint32)
 
     mf = cl.mem_flags
@@ -335,9 +385,8 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
 
     items_effective = n_items  # we interpret throughput for actual requested items
     # compute throughput normalized to requested n_items
-    # scale: (n_items / global_size) * (total_items_processed / total_time)
-    scale = n_items / float(global_size)
-    hash_per_sec = (total_items_processed / total_time) * scale
+
+    hash_per_sec = total_items_processed / total_time
 
     notes = {
         "device": dev_name,
@@ -793,7 +842,7 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
 
     out = {"meta":meta, "results": results, "aggregated": aggregated, "crack_estimates": estimates_per_test}
     if save_json:
-        outpath = os.path.join(OUTDIR, f"cpuPass_benchmark_{ts_utc()}.json")
+        outpath = os.path.join(OUTDIR, f"hash_benchmark_{ts_utc()}.json")
         with open(outpath, "w") as f:
             json.dump(out, f, indent=2)
         print("Saved results to", outpath)
