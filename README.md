@@ -9,7 +9,7 @@ The tool measures:
 - scrypt (configurable N, r, p)
 - Argon2 (configurable memory/time cost)
 - Parallel CPU performance across multiple worker processes
-- Optional GPU micro-benchmarks (OpenCL or Vulkan)
+- Optional GPU benchmarks (OpenCL or Vulkan)
 
 All results can be exported as JSON for later analysis.
 
@@ -19,8 +19,8 @@ All results can be exported as JSON for later analysis.
 
 - Synchronous and parallel CPU benchmarking
 - Automatic detection of available GPU backends
-- OpenCL MD5-round microbenchmark (real kernel execution)
-- Minimal Vulkan compute benchmark (initialization-only timing)
+- OpenCL MD5 benchmark (real kernel execution)
+- Vulkan compute benchmark (64-round MD5 computing)
 - Automatic keyspace estimation for common character sets
 - Crack time estimation for multiple attacker models
 - Configurable rounds, algorithms, GPU paths, and output
@@ -39,7 +39,8 @@ pip install bcrypt argon2-cffi psutil vulkan pyopencl
 
 Optional:
 - A working OpenCL runtime (GPU or CPU)
-- Vulkan SDK or drivers for Vulkan backend
+- The included .spv Vulkan kernel file
+- For Vulkan testing; A dedicated GPU
 
 ---
 
@@ -75,7 +76,6 @@ python main_pwdEncrypter.py --rounds 30 --opencl --vulkan
 | `--rounds N` | int | Number of iterations per sequential worker. Default: 30 |
 | `--opencl` | bool flag | Enables OpenCL GPU MD5 microbenchmark |
 | `--vulkan` | bool flag | Enables Vulkan GPU benchmark (initialization-based) |
-| `--no-save` | bool flag | Skip saving JSON results into `results/` |
 
 ---
 
@@ -84,7 +84,7 @@ python main_pwdEncrypter.py --rounds 30 --opencl --vulkan
 Results are written into the `results/` directory as:
 
 ```
-cpuPass_benchmark_<timestamp>.json
+hash_benchmark_<timestamp>.json
 ```
 
 The JSON includes:
@@ -112,11 +112,10 @@ The JSON includes:
 
 ### GPU Benchmarks
 **OpenCL:**
-- Runs an actual MD5 round kernel across millions of work-items.
+- Runs an actual MD5 round kernel 2 million of work-items.
 
 **Vulkan:**
-- Initializes a compute queue and simulates a workload.
-- (No real shader dispatch unless SPIR-V is supplied and extended.)
+- Runs a full, 64-round MD5 hashing with 2 million items
 
 ---
 
@@ -158,7 +157,7 @@ This directory is auto-created if missing.
 
 - Parallel execution is automatically skipped for memory-hard algorithms (scrypt, Argon2) due to if RAM constraints are present.
 - OpenCL benchmark validates device memory and work-group limits before running.
-- Vulkan path requires a functioning Vulkan loader and GPU driver.
+- Vulkan path requires the included Vulkan kernel from the repo and GPU driver.
 
 ---
 
