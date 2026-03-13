@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Run:
-  python main_hashBenchmarker.py --rounds 30 --opencl --vulkan
+  python main_pwdEncrypter.py --rounds 30 --run 5 --opencl --vulkan
 
 Dependencies:
-  pip install bcrypt argon2-cffi psutil vulkan pyopencl
+  pip install bcrypt argon2-cffi psutil vulkan pyopencl scipy pandas matplotlib seaborn
 
 """
 import os
@@ -19,7 +19,10 @@ import psutil
 from datetime import datetime
 import multiprocessing
 import math
-
+import scipy.stats as sp
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 # --- Importing GPU libraries with fallback ---
@@ -84,6 +87,8 @@ def ts_utc():
 
 def ensure_outdir():
     os.makedirs(OUTDIR, exist_ok=True)
+    os.makedirs(os.path.join(OUTDIR, "figures"), exist_ok=True)
+    os.makedirs(os.path.join(OUTDIR, "csv"), exist_ok=True)
 
 def mem_rss_bytes():
     return psutil.Process(os.getpid()).memory_info().rss
@@ -128,11 +133,24 @@ def measure_sync(func, inputs, rounds):
         t1 = time.perf_counter()
         times.append(t1 - t0)
     mem_after = mem_rss_bytes()
+
+    n = len(times)
+    mean = statistics.mean(times)
+    stdev = statistics.stdev(times) # empirical std
+    stderr = stdev / (n**0.5)
+    ci95 = sp.t.interval(0.95, df=n-1, loc=mean, scale=stderr) # confidence interval 95%
+
     return {
-        "samples": rounds,
-        "mean_s": statistics.mean(times),
+        "samples": n,
+        "mean_s": mean,
         "median_s": statistics.median(times),
-        "stdev_s": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "stdev_s": stdev,
+        "stderr_s": stderr,
+        "min_s": min(times),
+        "max_s": max(times),
+        "cv_percent": (stdev / mean) * 100,
+        "ci95_low_s": ci95[0],
+        "ci95_high_s": ci95[1],
         "rss_bytes_delta": mem_after - mem_before,
         "raw_times_s": times[:]
     }
@@ -204,16 +222,33 @@ def measure_parallel(descriptor, inputs, rounds, workers):
     wall_time = max(timings)
     total_hashes = rounds_per_worker * workers
     throughput = total_hashes / wall_time if wall_time > 0 else 0.0
+
+    # CI calculation from worker timings
+    n = len(timings)
+    mean_t = statistics.mean(timings)
+    stdev_t = statistics.stdev(timings) if n > 1 else 0.0
+    stderr_t = stdev_t / (n ** 0.5) if n > 0 else 0.0
+    ci95 = sp.t.interval(0.95, df=n-1, loc=mean_t, scale=stderr_t) if n > 1 else (mean_t, mean_t)
+
+    # throughput CI: inverse ratio because throughput = hashes/time
+    total_hashes_f = float(total_hashes)
+    ci95_throughput_low = total_hashes_f / ci95[1] if ci95[1] > 0 else 0.0
+    ci95_throughput_high = total_hashes_f / ci95[0] if ci95[0] > 0 else 0.0
+
     return {
         "workers": workers,
         "rounds_per_worker": rounds_per_worker,
         "total_hashes": total_hashes,
         "wall_time_s_est": wall_time,
-        "throughput_hash_per_s_est": throughput
+        "throughput_hash_per_s_est": throughput,
+        "worker_times": timings,
+        "mean_worker_time_s": mean_t,
+        "stdev_worker_time_s": stdev_t,
+        "ci95_throughput_low": ci95_throughput_low,
+        "ci95_throughput_high": ci95_throughput_high,
     }
-
 # -------------------------
-# GPU: OpenCL benchmark (MD5-round microbenchmark)
+# GPU: OpenCL benchmark (MD5-full benchmark)
 # -------------------------
 OPENCL_MD5_KERNEL = r"""
 __constant uint T[64] = {
@@ -286,14 +321,6 @@ __kernel void md5_round_kernel(__global const uint *input, __global uint *output
 
 
 def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type.GPU):
-    """
-    Robust OpenCL micro-benchmark:
-      - uses numpy.random.Generator.integers (for big high values),
-      - asking for machine limits, checking memory,
-      - rounding the global_size to the multiple of local_size,
-      - warmup + timed run + readback.
-    return value: dict { backend, device_name, items, seconds, hash_per_sec, notes }
-    """
     if not HAVE_OPENCL:
         raise RuntimeError("pyopencl not available on this system.")
 
@@ -405,6 +432,7 @@ def benchmark_opencl_md5(n_items=2_000_000, preferred_device_type=cl.device_type
 
 # -------------------------
 # GPU: Vulkan compute benchmark, only works with a dedicated GPU
+# -------------------------
 
 def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
     """
@@ -664,7 +692,7 @@ def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
             "shader": spv_path,
             "repeats": repeats,
             "local_size": local_size,
-            "info": "Real Vulkan compute MD5 — full 64-round shader dispatch."
+            "info": "Vulkan compute MD5 — full 64-round shader dispatch."
         }
     }
 
@@ -736,6 +764,313 @@ def compute_estimates_for_test(best_throughput, custom_attack_models=None, chars
     return out
 
 # -------------------------
+# PLOT RESULTS
+# -------------------------
+def plot_results(all_runs):
+    ensure_outdir()
+    # gather data in a DataFrame
+    rows = []
+    for run_idx, run in enumerate(all_runs):
+        for r in run["results"]:
+            if r["mode"] != "sequential":
+                continue
+            if "mean_s" not in r["metrics"]:
+                continue
+            rows.append({
+                "run": run_idx+1,
+                "algorithm": r["test"]["name"],
+                "mean_s": r["metrics"]["mean_s"],
+                "stdev_s": r["metrics"]["stdev_s"],
+                "cv_percent": r["metrics"]["cv_percent"],
+                "ci95_low": r["metrics"]["ci95_low_s"],
+                "ci95_high": r["metrics"]["ci95_high_s"],
+                "hash_per_s": 1.0 / r["metrics"]["mean_s"] if r["metrics"]["mean_s"] > 0 else 0,
+            })
+    df = pd.DataFrame(rows)
+
+    # 1. Boxplot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.boxplot(data=df, x="algorithm", y="hash_per_s", ax=ax)
+    ax.set_yscale("log") # log scale because of the differences between MD5 and bcrypt/Argon2
+    ax.set_title("Hash/s eloszlás algoritmusonként (összes futás × összes kör mérés)")
+    ax.set_xlabel("Algoritmus")
+    ax.set_ylabel("Hash/s (log skála)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig("results/figures/boxplot.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/boxplot.png")
+
+    # 2. Bargraph with 95% CI error lanes
+    summary = df.groupby("algorithm").agg(
+        grand_mean=("hash_per_s", "mean"),
+    ).reset_index()
+
+    ci_rows = []
+    for algo in summary["algorithm"]:
+        vals = df[df["algorithm"] == algo]["hash_per_s"].values
+        n = len(vals)
+        m = vals.mean()
+        s = vals.std(ddof=1)
+        stderr = s / (n ** 0.5)
+        ci = sp.t.interval(0.95, df=n - 1, loc=m, scale=stderr)
+        ci_rows.append({
+            "algorithm": algo,
+            "err_low": max(0, m - ci[0]),
+            "err_high": max(0, ci[1] - m)
+        })
+
+    ci_df = pd.DataFrame(ci_rows)
+    summary = summary.merge(ci_df, on="algorithm")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(summary["algorithm"], summary["grand_mean"],
+           yerr=[summary["err_low"], summary["err_high"]],
+           capsize=5, color="steelblue", edgecolor="black")
+    ax.set_yscale("log")
+    ax.set_title("Átlagos Hash/s 95%-os CI intervallummal")
+    ax.set_xlabel("Algoritmus")
+    ax.set_ylabel("Hash/s (log skála)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig("results/figures/bargraph_ci95.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/bargraph_ci95.png")
+
+    # 3. stability of runs
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for algo in df["algorithm"].unique():
+        subset = df[df["algorithm"] == algo]
+        ax.plot(subset["run"], subset["hash_per_s"], marker="o", label=algo)
+    ax.set_yscale("log")
+    ax.set_title("Hash/s stabilitás futásonként")
+    ax.set_xlabel("Futás száma")
+    ax.set_ylabel("Hash/s (log skála)")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    plt.savefig("results/figures/stability.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/stability.png")
+
+    #4. CV% table exported to .csv too
+    cv_summary = df.groupby("algorithm").agg(
+        grand_mean_hash_s=("hash_per_s", "mean"),
+        stdev_between_runs=("hash_per_s", "std"),
+        cv_percent=("cv_percent", "mean"),
+    ).reset_index()
+
+    cv_summary.to_csv("results/csv/summary_table.csv", index=False)
+    print("Saved: results/csv/summary_table.csv")
+    print(cv_summary.to_string(index=False))
+
+# -------------------------
+# PLOT PARALLEL RUNS
+# -------------------------
+def plot_parallel_results(all_runs):
+    ensure_outdir()
+    # Gather data
+    rows = []
+    for run_idx, run in enumerate(all_runs):
+        for r in run["results"]:
+            if r["mode"] != "parallel":
+                continue
+            if "throughput_hash_per_s_est" not in r["metrics"]:
+                continue
+            rows.append({
+                "run": run_idx+1,
+                "algorithm": r["test"]["name"],
+                "workers": r["metrics"]["workers"],
+                "throughput_hash_per_s": r["metrics"]["throughput_hash_per_s_est"],
+                "wall_time_s": r["metrics"]["wall_time_s_est"],
+                "total_hashes": r["metrics"]["total_hashes"],
+            })
+    df = pd.DataFrame(rows)
+
+    # 1. Throughput vs Workers bargraph per algorithms
+    fig, ax = plt.subplots(figsize=(14, 6))
+    sns.barplot(
+        data=df,
+        x="algorithm",
+        y="throughput_hash_per_s",
+        hue="workers", # diff colors for every worker nums
+        errorbar="sd",
+        ax=ax
+    )
+    ax.set_yscale("log")
+    ax.set_title("Többszálas Hash/s - algoritmus és worker szám alapján")
+    ax.set_xlabel("Algoritmus")
+    ax.set_ylabel("Throughput Hash/s (log skála)")
+    ax.legend(title="Workerek", bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig("results/figures/parallel_throughput.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/parallel_throughput.png")
+
+    # 2. Scalability - 1 worker vs N worker (speedup)
+    # shows how much it speeds up by parallelism
+    baseline = df[df["workers"] == 1][["algorithm", "throughput_hash_per_s"]].copy()
+    baseline = baseline.groupby("algorithm")["throughput_hash_per_s"].mean().reset_index()
+    baseline.columns = ["algorithm", "baseline_hps"]
+
+    df_speedup = df.merge(baseline, on="algorithm")
+    df_speedup["speedup"] = df_speedup["throughput_hash_per_s"] / df_speedup["baseline_hps"]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    sns.lineplot(
+        data=df_speedup,
+        x="workers",
+        y="speedup",
+        hue="algorithm",
+        marker="o",
+        ax=ax
+    )
+    # reference line for ideal linear scaling
+    max_workers = df["workers"].max()
+    ax.plot(
+        [1, max_workers], [1, max_workers],
+        "k--", linewidth=1, label="Ideális lineáris skálázódás"
+    )
+    ax.set_title("Többszálas gyorsulás egy szálhoz viszonyítva")
+    ax.set_xlabel("Worker szám")
+    ax.set_ylabel("Gyorsulás (x)")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    plt.savefig("results/figures/parallel_speedup.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/parallel_speedup.png")
+
+    # 3. Wall time heatmap
+    # algorithm x worker matrix, with wall time values
+    pivot = df.groupby(["algorithm", "workers"])["wall_time_s"].mean().unstack()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.heatmap(
+        pivot,
+        annot=True, # values printed out in cells
+        fmt=".6f",
+        cmap="RdYlGn_r", # red == slow, green == fast
+        ax=ax
+    )
+    ax.set_title("Wall time (s) - algoritmus x worker szám")
+    ax.set_xlabel("Worker szám")
+    ax.set_ylabel("Algoritmus")
+    plt.tight_layout()
+    plt.savefig("results/figures/parallel_heatmap.png", dpi=150)
+    plt.close()
+    print("Saved: results/figures/parallel_heatmap.png")
+
+    # 4. CSV export
+    summary = df.groupby(["algorithm", "workers"]).agg(
+        mean_throughput=("throughput_hash_per_s", "mean"),
+        stdev_throughput=("throughput_hash_per_s", "std"),
+        mean_wall_time=("wall_time_s", "mean")
+    ).reset_index()
+
+    summary.to_csv("results/csv/parallel_summary.csv", index=False)
+    print("Saved: results/csv/parallel_summary.csv")
+    print(summary.to_string(index=False))
+
+
+# -------------------------
+# PLOT PER ALGORITHM
+# -------------------------
+def plot_per_algorithm(all_runs):
+    ensure_outdir()
+    # Gather data
+    seq_rows = []
+    par_rows = []
+
+    for run_idx, run in enumerate(all_runs):
+        for r in run["results"]:
+            name = r["test"]["name"]
+            metrics = r["metrics"]
+
+            if r["mode"] == "sequential" and "mean_s" in metrics:
+                seq_rows.append({
+                    "run": run_idx + 1,
+                    "algorithm": name,
+                    "hash_per_s": 1.0 / metrics["mean_s"],
+                    "ci95_low": 1.0 / metrics["ci95_low"] if metrics.get("ci95_low") else None,
+                    "ci95_high": 1.0 / metrics["ci95_high"] if metrics.get("ci95_high") else None,
+                })
+            elif r["mode"] == "parallel" and "throughput_hash_per_s_est" in metrics:
+                par_rows.append({
+                    "run": run_idx + 1,
+                    "algorithm": name,
+                    "workers": metrics["workers"],
+                    "hash_per_s": metrics["throughput_hash_per_s_est"],
+                    "wall_time_s": metrics["wall_time_s_est"],
+                    "ci95_throughput_low": metrics.get("ci95_throughput_low", 0),
+                    "ci95_throughput_high": metrics.get("ci95_throughput_high", 0)
+                })
+    df_seq = pd.DataFrame(seq_rows)
+    df_par = pd.DataFrame(par_rows)
+
+    algorithms = df_seq["algorithm"].unique()
+
+    for algo in algorithms:
+        seq = df_seq[df_seq["algorithm"] == algo]
+        par = df_par[df_par["algorithm"] == algo]
+
+        # for every algorithm, 1 figure and 2 subplot next to each other
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f"{algo} - Teljesítmény összehasonlítás", fontsize=14, fontweight="bold")
+
+        # left side: one thread boxplot based on 5 runs
+        ax = axes[0]
+        ax.boxplot(seq["hash_per_s"], tick_labels=["Egyszálas"])
+        grand_mean = seq["hash_per_s"].mean()
+        ax.axhline(grand_mean, color="red", linestyle="--", linewidth=1, label=f"Átlag: {grand_mean:.0f}")
+        ax.set_title("Egyszálas Hash/s (összes futás)")
+        ax.set_ylabel("Hash/s")
+        ax.legend()
+
+        # right side: parallel throughput vs workers
+        ax = axes[1]
+        if not par.empty:
+            par_summary = par.groupby("workers").agg(
+                mean=("hash_per_s", "mean"),
+                std=("hash_per_s", "std"),
+                ci95_low=("ci95_throughput_low", "mean"),
+                ci95_high=("ci95_throughput_high", "mean")
+            ).reset_index()
+            # CI errorbars
+            err_low = (par_summary["mean"] - par_summary["ci95_low"]).clip(lower=0)
+            err_high = (par_summary["ci95_high"] - par_summary["mean"]).clip(lower=0)
+
+            ax.errorbar(
+                par_summary["workers"],
+                par_summary["mean"],
+                yerr=[err_low, err_high],
+                marker="o",
+                capsize=5,
+                color="steelblue",
+                label="Mért throughput ± 95% CI"
+            )
+
+            #ideal linear scaling
+            baseline = par_summary[par_summary["workers"] == 1]["mean"].values
+            if len(baseline) > 0:
+                ideal=[baseline[0] * w for w in par_summary["workers"]]
+                ax.plot(par_summary["workers"], ideal, "r--", linewidth=1, label="Ideális lineáris")
+            ax.set_title("Többszálas throughput")
+            ax.set_xlabel("Worker szám")
+            ax.set_ylabel("Hash/s")
+            ax.legend()
+        else:
+            ax.text(0.5,0.5, "Többszálas futás\nnem elérhető\n(memory-hard algoritmus)",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=11, color="gray")
+            ax.set_title("Többszálas throughput")
+
+        plt.tight_layout()
+        plt.savefig(f"results/figures/{algo}_combined.png", dpi=150)
+        plt.close()
+        print(f"Saved: results/figures/{algo}_combined.png")
+
+
+
+# -------------------------
 # RUN ALL
 # -------------------------
 def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
@@ -778,7 +1113,7 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
     for t in tests:
         for w in WORKER_COUNTS:
             if t["kind"] in ["scrypt", "argon2"] and w > 1:
-                print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy, uses internal parallelism)")
+                print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy)")
                 continue
             print(f"[PAR] {t['name']} workers={w}")
             try:
@@ -848,10 +1183,41 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
         print("Saved results to", outpath)
     return out
 
+## Run the script multiple times
+def run_multiple(rounds=ROUNDS, n_runs=5, do_opencl=False, do_vulkan=False):
+    all_runs = []
+    for i in range(n_runs):
+        print(f"\n{'='*50}")
+        print(f"=== Running {i+1}/{n_runs} ===")
+        print(f"{'='*50}")
+        result = run_all(
+            rounds=rounds,
+            do_opencl=do_opencl,
+            do_vulkan=do_vulkan,
+            save_json=True
+        )
+        all_runs.append(result)
+    return all_runs
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=int, default=ROUNDS)
+    parser.add_argument("--runs", type=int, default=5, help="Number of script executions")
     parser.add_argument("--opencl", action="store_true", help="Run OpenCL GPU benchmark (requires pyopencl)")
     parser.add_argument("--vulkan", action="store_true", help="Attempt Vulkan GPU benchmark (requires Vulkan env)")
     args = parser.parse_args()
-    run_all(rounds=args.rounds, do_opencl=args.opencl, do_vulkan=args.vulkan)
+
+    if args.runs > 1:
+        all_runs = run_multiple(
+            rounds=args.rounds,
+            n_runs=args.runs,
+            do_opencl=args.opencl,
+            do_vulkan=args.vulkan
+        )
+        print("\n=== Generating plots... ===")
+        plot_results(all_runs)
+        plot_parallel_results(all_runs)
+        plot_per_algorithm(all_runs)
+        print("\n=== Done! Results are in results/figures/ folder ===")
+    else:
+        run_all(rounds=args.rounds, do_opencl=args.opencl, do_vulkan=args.vulkan)
