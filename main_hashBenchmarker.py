@@ -56,11 +56,15 @@ PASSWORDS = [
 BCRYPT_COSTS = [10, 12]
 SCRYPT_PARAMS = [
     (2**14, 8, 1),
-    (2**15, 8, 1)
+    (2**15, 8, 1),
+    (2**14, 8, 2),
+    (2**15, 8, 2)
 ]
 ARGON2_PARAMS = [
     {"time_cost":1, "memory_cost":65536, "parallelism":1},   # 64 MB
-    {"time_cost":2, "memory_cost":131072, "parallelism":1}   # 128 MB
+    {"time_cost":2, "memory_cost":131072, "parallelism":1},   # 128 MB
+    {"time_cost":1, "memory_cost":65536, "parallelism":2},   # 64 MB p=2
+    {"time_cost":2, "memory_cost":131072, "parallelism":2}   # 128 MB p=2
 ]
 WORKER_COUNTS = [1, max(1, multiprocessing.cpu_count()//2), multiprocessing.cpu_count()]
 
@@ -211,8 +215,10 @@ def mp_worker(descriptor, inputs, rounds_per_worker):
 
 ## measurement with multiple worker/nummber of tasks
 def measure_parallel(descriptor, inputs, rounds, workers):
-    if descriptor["kind"] in ["scrypt", "argon2"] and workers > 1:
-        raise ValueError("Parallel run for memory-hard algorithm skipped")
+    if descriptor["kind"] in ["scrypt", "argon2"]:
+        algo_parallelism = descriptor["params"].get("parallelism", descriptor["params"].get("p", 1))
+        if workers > algo_parallelism:
+            raise ValueError("Parallel run for memory-hard algorithm skipped")
     rounds_per_worker = max(1, rounds // workers)
     pool = multiprocessing.Pool(processes=workers)
     args = [(descriptor, inputs, rounds_per_worker) for _ in range(workers)]
@@ -486,7 +492,6 @@ def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
     if compute_family is None:
         raise RuntimeError("No compute queue family found.")
 
-
     queue_priority = (ctypes.c_float * 1)(1.0)
     device = vk.vkCreateDevice(phys, vk.VkDeviceCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -495,7 +500,7 @@ def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
             sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             queueFamilyIndex=compute_family,
             queueCount=1,
-            pQueuePriorities=ctypes.pointer(queue_priority)
+            pQueuePriorities=ctypes.addressof(queue_priority)
         )
     ), None)
     queue = vk.vkGetDeviceQueue(device, compute_family, 0)
@@ -537,22 +542,19 @@ def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
     buf_in,  mem_in,  _  = make_buffer(in_bytes,  vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
     buf_out, mem_out, _  = make_buffer(out_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
 
-
     ptr = vk.vkMapMemory(device, mem_in, 0, in_bytes, 0)
-    import numpy as np
     rng = np.random.default_rng()
-    host_in = rng.integers(0, 2**32, size=item_count * 16, dtype=np.uint32)
-    ctypes.memmove(ptr, host_in.ctypes.data, in_bytes)
+    host_in = rng.integers(0, 2 ** 32, size=item_count * 16, dtype=np.uint32)
+    ptr[:] = bytes(host_in.tobytes())
     vk.vkUnmapMemory(device, mem_in)
-
 
     with open(spv_path, "rb") as f:
         spv_bytes = f.read()
-    spv_words = np.frombuffer(spv_bytes, dtype=np.uint32)
+
     shader_module = vk.vkCreateShaderModule(device, vk.VkShaderModuleCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         codeSize=len(spv_bytes),
-        pCode=spv_words.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32))
+        pCode=spv_bytes
     ), None)
 
 
@@ -652,7 +654,7 @@ def benchmark_vulkan_md5(spv_path="md5_vulkan.spv", n_items=2_000_000):
             sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             commandBufferCount=1, pCommandBuffers=[cmd_buf]
         )], fence)
-        vk.vkWaitForFences(device, 1, [fence], vk.VK_TRUE, int(10_000_000_000))  # 10s timeout
+        vk.vkWaitForFences(device, 1, [fence], vk.VK_TRUE, 10_000_000_000)  # 10s timeout
         vk.vkResetFences(device, 1, [fence])
 
     submit_and_wait()  # warmup
@@ -1112,16 +1114,18 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
     # CPU parallel
     for t in tests:
         for w in WORKER_COUNTS:
-            if t["kind"] in ["scrypt", "argon2"] and w > 1:
-                print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy)")
-                continue
+            if t["kind"] in ["scrypt", "argon2"]:
+                algo_parallelism = t["params"].get("parallelism", t["params"].get("p", 1))
+                if w > algo_parallelism:
+                    print(f"[PAR] Skipping {t['name']} workers={w} (memory-heavy, algo_parallelism={algo_parallelism})")
+                    continue
             print(f"[PAR] {t['name']} workers={w}")
             try:
                 pmetrics = measure_parallel(t, PASSWORDS, rounds, w)
             except Exception as e:
                 pmetrics = {"error": str(e)}
                 print("Parallel measurement skipped due to:", e)
-            results.append({"mode":"parallel", "test":t, "metrics":pmetrics})
+            results.append({"mode": "parallel", "test": t, "metrics": pmetrics})
 
     # GPU OpenCL benchmark (optional)
     if do_opencl:
@@ -1138,10 +1142,12 @@ def run_all(rounds=ROUNDS, do_opencl=False, do_vulkan=False, save_json=True):
     if do_vulkan:
         print("[GPU-VULKAN] Running Vulkan benchmarks...")
         try:
-            vk_res = benchmark_vulkan_md5(n_items=2_000_000)
+            vk_res = benchmark_vulkan_md5("md5_vulkan.spv", n_items=2_000_000)
             print("[GPU-VULKAN] done:", vk_res)
             results.append({"mode":"gpu_vulkan", "test":{"name":"md5_vulkan_round", "kind":"vulkan_md5"}, "metrics":vk_res})
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print("[GPU-VULKAN] failed:", e)
             results.append({"mode":"gpu_vulkan", "test":{"name":"md5_vulkan_round", "kind":"vulkan_md5"}, "metrics":{"error":str(e)}})
 
@@ -1202,7 +1208,7 @@ def run_multiple(rounds=ROUNDS, n_runs=5, do_opencl=False, do_vulkan=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=int, default=ROUNDS)
-    parser.add_argument("--runs", type=int, default=5, help="Number of script executions")
+    parser.add_argument("--runs", type=int, default=1, help="Number of script executions")
     parser.add_argument("--opencl", action="store_true", help="Run OpenCL GPU benchmark (requires pyopencl)")
     parser.add_argument("--vulkan", action="store_true", help="Attempt Vulkan GPU benchmark (requires Vulkan env)")
     args = parser.parse_args()
