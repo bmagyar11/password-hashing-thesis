@@ -13,6 +13,8 @@ import json
 import argparse
 import statistics
 import hashlib
+from os import stat_result
+
 import bcrypt
 from argon2 import PasswordHasher
 import psutil
@@ -1070,7 +1072,247 @@ def plot_per_algorithm(all_runs):
         plt.close()
         print(f"Saved: results/figures/{algo}_combined.png")
 
+# Normality and t-test
+def test_normality_and_ttest(all_runs):
+    """
+    For every algorithm:
+    - Shapiro-Wilk normality test for sequential run times
+    - One sample t-test: Do runs' mean values have normality?
+    - t-test per pair: cost10 vs cost12, scrypt n1 vs n2, argon2 t1 vs t2
+    """
+    ensure_outdir()
 
+    #Gather data
+    raw_data = {}
+    run_means = {}
+    par_data = {}
+
+    for run_idx, run in enumerate(all_runs):
+        for r in run["results"]:
+            name = r["test"]["name"]
+            metrics = r["metrics"]
+
+            #sequential runs
+            if r["mode"] == "sequential" and "raw_times_s" in metrics:
+                if name not in raw_data:
+                    raw_data[name] = []
+                    run_means[name] = []
+                raw_data[name].extend(metrics["raw_times_s"])
+                run_means[name].append(metrics["mean_s"])
+
+            #parallel runs
+            elif r["mode"] == "parallel" and "throughput_hash_per_s_est" in metrics:
+                workers = metrics["workers"]
+                key = f"{name}_w{workers}"
+                if key not in par_data:
+                    par_data[key] = []
+                par_data[key].append(metrics["throughput_hash_per_s_est"])
+
+    # Shapiro-Wilk test sequential
+    print("\n" + "="*60)
+    print("SHAPIRO-WILK NORMALITÁS TESZT (egyszálas raw times)")
+    print("=" * 60)
+    print(f"{'Algoritmus':<30} {'W statisztika':>15} {'p-érték':>12} {'Normális?':>10}")
+    print("-"*60)
+
+    normality_results = {}
+    for algo, times in raw_data.items():
+        #Shapiro-Wilk works stable on max 5000 sample
+        sample = times[:5000] if len(times) > 5000 else times
+        stat, p = sp.shapiro(sample)
+        is_normal = p > 0.05
+        normality_results[algo] = {
+            "shapiro_W": float(stat),
+            "shapiro_p": float(p),
+            "is_normal": bool(is_normal),
+            "n_samples": int(len(times))
+        }
+        print(f"{algo:<30} {stat:>15.6f} {p:>12.6f} {'IGEN' if is_normal else 'NEM':>10}")
+
+    # Shapiro-Wilk test parallel
+    print("\n" + "=" * 60)
+    print("SHAPIRO-WILK NORMALITÁS TESZT (PÁRHUZAMOS throughput értékek)")
+    print("(futásonkénti throughput eloszlása worker számonként)")
+    print("=" * 60)
+    print(f"{'Algoritmus + workers':<35} {'W':>10} {'p-érték':>12} {'Normális?':>10}")
+    print("-" * 60)
+
+    normality_par_results = {}
+    for key, values in par_data.items():
+        if len(values) < 3:
+            print(f"{key:<35} {'- túl kevés minta -':>38}")
+            continue
+        stat, p = sp.shapiro(values)
+        is_normal = p > 0.05
+        normality_par_results[key] = {
+            "shapiro_W": float(stat),
+            "shapiro_p": float(p),
+            "is_normal": bool(is_normal),
+            "n_samples": int(len(values))
+        }
+        print(f"{key:<35} {stat:>10.6f} {p:>12.6f} {'IGEN' if is_normal else 'NEM':>10} {len(values):>5}")
+
+    # Distribution visualization sequential
+    for algo, times in raw_data.items():
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig.suptitle(f"Eloszlásvizsgálat — {algo}", fontsize=13, fontweight="bold")
+
+        # Histogram + normal fit
+        mu, sigma = sp.norm.fit(times)
+        x = np.linspace(min(times), max(times), 100)
+        ax = axes[0]
+        ax.hist(times, bins=30, density=True, alpha=0.6, color="steelblue", label="Mért")
+        ax.plot(x, sp.norm.pdf(x, mu, sigma), "r-", linewidth=2, label="Normális illesztés")
+        p_val = normality_results[algo]["shapiro_p"]
+        ax.set_title(f"Hisztogram\nShapiro-Wilk p={p_val:.4f} — {'Normális' if p_val > 0.05 else 'Nem normális'}")
+        ax.set_xlabel("Idő (s)")
+        ax.set_ylabel("Sűrűség")
+        ax.legend()
+
+        # Q-Q plot
+        ax = axes[1]
+        sp.probplot(times, dist="norm", plot=ax)
+        ax.set_title("Q-Q plot")
+        ax.set_xlabel("Elméleti kvantilisek")
+        ax.set_ylabel("Minta kvantilisek")
+
+        plt.tight_layout()
+        plt.savefig(f"results/figures/{algo}_normality.png", dpi=150)
+        plt.close()
+        print(f"Saved: results/figures/{algo}_normality.png")
+
+    # Distribution visualization parallel
+    for key, values in par_data.items():
+        if len(values) < 3:
+            continue
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig.suptitle(f"Eloszlásvizsgálat — {key}", fontsize=13, fontweight="bold")
+
+        mu, sigma = sp.norm.fit(values)
+        x = np.linspace(min(values), max(values), 100)
+
+        # Hisztogram
+        ax = axes[0]
+        ax.hist(values, bins=10, density=True, alpha=0.6, color="darkorange", label="Mért")
+        ax.plot(x, sp.norm.pdf(x, mu, sigma), "r-", linewidth=2, label="Normális illesztés")
+        p_val = normality_par_results.get(key, {}).get("shapiro_p", float("nan"))
+        ax.set_title(f"Hisztogram\nShapiro-Wilk p={p_val:.4f} — {'Normális' if p_val > 0.05 else 'Nem normális'}")
+        ax.set_xlabel("Hash/s")
+        ax.set_ylabel("Sűrűség")
+        ax.legend()
+
+        # Q-Q plot
+        ax = axes[1]
+        sp.probplot(values, dist="norm", plot=ax)
+        ax.set_title("Q-Q plot")
+        ax.set_xlabel("Elméleti kvantilisek")
+        ax.set_ylabel("Minta kvantilisek")
+
+        plt.tight_layout()
+        plt.savefig(f"results/figures/{key}_normality.png", dpi=150)
+        plt.close()
+        print(f"Saved: results/figures/{key}_normality.png")
+
+    # One sample t-test among runs
+    print("\n" + "="*60)
+    print("EGYMINTÁS t-PRÓBA (futtatások mean értékei)")
+    print("H0: a futtatások átlaga = az összes mérés grand mean-je")
+    print("="*60)
+    print(f"{'Algoritmus':<30} {'t statisztika':>15} {'p-érték':>12} {'H0 elvetve?':>12}")
+    print("-"*60)
+
+    ttest_results = {}
+    for algo, means in run_means.items():
+        grand_mean = np.mean(run_means[algo])
+        t_stat, p_val = sp.ttest_1samp(means, popmean=grand_mean)
+        ttest_results[algo] = {
+            "t_stat": float(t_stat),
+            "p_value": float(p_val),
+            "rejected": bool(p_val < 0.05)
+        }
+        print(f"{algo:<30} {t_stat:>15.6f} {p_val:>12.6f} {'IGEN' if p_val < 0.05 else "NEM":>12}")
+
+    # Welch t-test between parallel worker numbers
+    print("\n" + "=" * 60)
+    print("WELCH t-PRÓBA — párhuzamos worker szám hatása")
+    print("H0: 1 worker vs N worker throughput nem tér el szignifikánsan")
+    print("=" * 60)
+    print(f"{'Összehasonlítás':<40} {'t':>10} {'p-érték':>12} {'Szignifikáns?':>14}")
+    print("-" * 60)
+
+    welch_par_results = {}
+    algorithms_base = list(raw_data.keys())
+    for algo in algorithms_base:
+        baseline_key = f"{algo}_w1"
+        if baseline_key not in par_data or len(par_data[baseline_key]) < 3:
+            continue
+        for workers in [4, 8]:
+            compare_key = f"{algo}_w{workers}"
+            if compare_key not in par_data or len(par_data[compare_key]) < 3:
+                continue
+            t_stat, p_val = sp.ttest_ind(
+                par_data[baseline_key],
+                par_data[compare_key],
+                equal_var=False #Welch
+            )
+            label = f"{algo}: 1w vs {workers}w"
+            welch_par_results[label] = {
+                "t_stat": float(t_stat),
+                "p_value": float(p_val),
+                "rejected": bool(p_val < 0.05)
+            }
+
+            sig = "IGEN" if p_val < 0.05 else "NEM"
+            print(f"{label:<40} {t_stat:>10.4f} {p_val:>12.6f} {sig:>14}")
+
+    # t-test per pairs
+    print("\n" + "="*60)
+    print("PÁRONKÉNTI WELCH t-PRÓBA (konfiguráció összehasonlítások)")
+    print("H0: a két konfiguráció teljesítménye nem tér el szignifikánsan")
+    print("="*60)
+    
+    pairs = [
+        ("bcrypt_cost10", "bcrypt_cost12", "bcrypt cost10 vs cost12"),
+        ("scrypt_n16384_r8_p1", "scrypt_n32768_r8_p1", "scrypt n=16384 vs n=32768"),
+        ("argon2_t1_m64MB_p1", "argon2_t2_m128MB_p1", "argon2 t=1 vs t=2"),
+        ("md5", "sha256", "MD5 vs SHA-256"),
+    ]
+    
+    paired_results = {}
+    for algo1, algo2, label in pairs:
+        if algo1 not in raw_data or algo2 not in raw_data:
+            print(f"{label}: hiányzó adat")
+            continue
+            
+        # cutting up to equal lengths
+        n = min(len(raw_data[algo1]), len(raw_data[algo2]))
+        t_stat, p_val = sp.ttest_ind(
+            raw_data[algo1][:n],
+            raw_data[algo2][:n],
+            equal_var=False #cause of Welch t-test
+        )
+        paired_results[label] = {
+            "t_stat": float(t_stat),
+            "p_value": float(p_val),
+            "rejected": bool(p_val < 0.05)
+        }
+        sig = "SZIGNIFIKÁNS" if p_val < 0.05 else "NEM SZIGNIFIKÁNS"
+        print(f"{label:<35} t={t_stat:.4f} p={p_val:.6f} {sig}")
+
+    # Save to JSON
+    stat_out = {
+        "normality_sequential": normality_results,
+        "normality_parallel": normality_par_results,
+        "ttest_sequential_runs": ttest_results,
+        "welch_parallel_workers": welch_par_results,
+        "ttest_pairs": paired_results
+    }
+    with open("results/csv/statistical_tests.json", "w") as f:
+        json.dump(stat_out, f, indent=2)
+    print("\nSaved: results/csv/statistical_tests.json")
+
+    return stat_out
 
 # -------------------------
 # RUN ALL
@@ -1220,10 +1462,11 @@ if __name__ == "__main__":
             do_opencl=args.opencl,
             do_vulkan=args.vulkan
         )
-        print("\n=== Generating plots... ===")
+        print("\n=== Generating plots and statistics... ===")
         plot_results(all_runs)
         plot_parallel_results(all_runs)
         plot_per_algorithm(all_runs)
-        print("\n=== Done! Results are in results/figures/ folder ===")
+        stat_results = test_normality_and_ttest(all_runs)
+        print("\n=== Done! Results are in results/figures/ and results/csv/ folder ===")
     else:
         run_all(rounds=args.rounds, do_opencl=args.opencl, do_vulkan=args.vulkan)

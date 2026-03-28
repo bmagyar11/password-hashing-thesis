@@ -10,6 +10,7 @@ The tool measures:
 - Argon2 (configurable memory/time cost)
 - Parallel CPU performance across multiple worker processes
 - Optional GPU benchmarks (OpenCL or Vulkan)
+- Statistics such as Normality and Saphiro-Welch t-tests are also executed for further manual testing
 
 All results can be exported as JSON for later analysis.
 Plotting results also available.
@@ -25,6 +26,7 @@ Plotting results also available.
 - Automatic keyspace estimation for common character sets
 - Crack time estimation for multiple attacker models
 - Configurable rounds, runs, algorithms, GPU paths, plotting, and output
+- Saphiro-Welch t-test and normality tests
 
 ---
 
@@ -109,7 +111,7 @@ hash_benchmark_<timestamp>.json
 ```
 
 Generated plots are created into the `results/figures/` directory.
-Summary tables can be located at `results/csv/` directory.
+Summary tables and normality & t-test results can be located at `results/csv/` directory.
 
 The JSON includes:
 - System metadata
@@ -120,6 +122,11 @@ The JSON includes:
   - multiple attacker models
   - common charset configurations
 
+The normality JSON includes:
+- Shapiro w value
+- Shapiro p-value
+- Is the test follows normality ? (p_value > 0.05 ?)
+- Sample number that it was based on
 ---
 
 ## Algorithms Benchmarked
@@ -154,6 +161,7 @@ Using the measured best hash-rate per algorithm, the estimator computes brute-fo
 - Printable ASCII (95 chars)
 
 ### Default Attacker Models
+#### Attacker models are created based on multiplication
 - Local CPU
 - Single GPU estimate
 - 8-GPU cluster estimate
@@ -177,7 +185,7 @@ All plot outputs are stored under:
 ```
 results/figures/
 ```
-All summarizing tables are located at:
+All summarizing tables and normality tests are located at:
 ```
 results/csv/
 ```
@@ -188,7 +196,7 @@ All directories are auto-created if missing.
 
 ## Notes
 
-- Parallel execution is automatically skipped for memory-hard algorithms (scrypt, Argon2) due to if RAM constraints are present.
+- Parallel execution is automatically skipped for memory-hard algorithms (scrypt, Argon2) and falling back to algorithm parallelism due to if RAM constraints are present.
 - OpenCL benchmark validates device memory and work-group limits before running.
 - Vulkan path requires a dedicated GPU and re-compiled shader file.
 
